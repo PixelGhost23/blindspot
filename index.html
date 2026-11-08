@@ -33,6 +33,7 @@ body{background:var(--bg);color:var(--fg);font-family:var(--font-ui);font-size:1
 #map{position:fixed;inset:0;background:var(--bg)}
 .leaflet-container{font-family:var(--font-ui);background:var(--bg)}
 .leaflet-control-attribution{font-size:10px}
+@media (prefers-color-scheme:dark){.leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(.9) contrast(.88) saturate(.6)}}
 
 .top{position:fixed;top:0;left:0;right:0;z-index:1000;
   padding-top:calc(env(safe-area-inset-top,0px) + 10px);padding-bottom:8px;
@@ -337,9 +338,10 @@ const dark = matchMedia("(prefers-color-scheme: dark)");
 let tiles;
 function setTiles() {
   if (tiles) tiles.remove();
-  tiles = L.tileLayer(`https://{s}.basemaps.cartocdn.com/${dark.matches ? "dark_all" : "light_all"}/{z}/{x}/{y}{r}.png`, {
-    maxZoom: 19, subdomains: "abcd",
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
+  // Standard OSM tiles: no key needed. Dark mode is done with a CSS filter on the tile pane.
+  tiles = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
   }).addTo(map);
   let warned = false;
   tiles.on("tileerror", () => { if (!warned && !S.busy) { warned = true; status(PREVIEW_MSG, "err"); } });
