@@ -288,7 +288,8 @@ const CFG = {
   styleLight: "https://tiles.openfreemap.org/styles/liberty",
   styleDark: "https://tiles.openfreemap.org/styles/dark",
   excludeBudgetM: 9000,   // public Valhalla caps total exclusion-polygon perimeter (~10 km)
-  maxPasses: 4,
+  maxPasses: 6,
+  maxCalls: 14,           // routing requests per search, to stay polite to the free server
   waypoints: 8,
   offRouteM: 45,
   cacheDays: 7
@@ -406,7 +407,53 @@ const Fmt = {
 const TURN = { 1: 0, 2: 0, 3: 0, 4: null, 5: null, 6: null, 7: 0, 8: 0, 9: 45, 10: 90, 11: 135, 12: 180, 13: 180, 14: -135, 15: -90, 16: -45,
   17: 0, 18: 40, 19: -40, 20: 45, 21: -45, 22: 0, 23: 30, 24: -30, 25: 0, 26: 70, 27: 45 };
 
-if (typeof module !== "undefined") module.exports = { Geo, Fmt, TURN };
+/* Find the route that passes the fewest cameras.
+   Cameras are excluded in batches; when a batch has no way around, each camera is tried on its own, the
+   ones with a detour are kept and the true blockers (only road through, or at the start/end) are skipped.
+   Every route seen along the way, plus the server's alternates, is a candidate: fewest cameras wins, then fastest. */
+async function minimizeCameras({ from, to, cams, fast, r, route, maxPasses = 6, maxCalls = 14, budgetM = 9000, stale = () => false, onTry = () => {} }) {
+  const onRoute = (rt, list) => list.filter(c => Geo.snap(rt.coords, rt.cum, c.p).d <= r + 5);
+  const cap = Math.max(1, Math.floor(budgetM / (8 * r)));
+  const clear = r + 40;
+  const atEnds = c => Geo.meters(c.p, from) < clear || Geo.meters(c.p, to) < clear;
+  const excluded = new Map(), stuck = new Set();
+  const cands = [fast, ...(fast.alts || [])];
+  let best = fast, calls = 0, capped = false, ends = 0;
+  const tryRoute = async extra => {
+    if (calls >= maxCalls) return null;
+    calls++; onTry(calls);
+    try { return await route([...excluded.values(), ...extra].map(c => Geo.square(c.p, r))); } catch { return false; }
+  };
+  for (let pass = 0; pass < maxPasses; pass++) {
+    let hits = onRoute(best, cams).filter(c => !excluded.has(c.id) && !stuck.has(c.id));
+    for (const c of hits) if (atEnds(c)) { stuck.add(c.id); ends++; }
+    hits = hits.filter(c => !stuck.has(c.id));
+    if (!hits.length) break;
+    const room = cap - excluded.size;
+    if (room <= 0) { capped = true; break; }
+    const add = hits.slice(0, room);
+    if (add.length < hits.length) capped = true;
+    let rt = await tryRoute(add);
+    if (stale()) return null;
+    if (rt === null) { capped = true; break; }
+    if (rt) { add.forEach(c => excluded.set(c.id, c)); best = rt; cands.push(rt); continue; }
+    // the batch had no way around: try its cameras one at a time
+    for (const c of add) {
+      if (!onRoute(best, [c]).length) continue;          // an earlier detour already skipped it
+      rt = await tryRoute([c]);
+      if (stale()) return null;
+      if (rt === null) { capped = true; break; }
+      if (rt) { excluded.set(c.id, c); best = rt; cands.push(rt); }
+      else stuck.add(c.id);
+    }
+    if (capped) break;
+  }
+  const scored = cands.map(rt => ({ rt, n: onRoute(rt, cams).length }));
+  scored.sort((a, b) => a.n - b.n || a.rt.secs - b.rt.secs);
+  return { route: scored[0].rt, blockers: stuck.size - ends, ends, capped, calls };
+}
+
+if (typeof module !== "undefined") module.exports = { Geo, Fmt, TURN, minimizeCameras };
 
 /* ================= network ================= */
 async function getJSON(url, opts = {}, ms = 30000) {
@@ -423,18 +470,25 @@ async function getJSON(url, opts = {}, ms = 30000) {
   } finally { clearTimeout(t); }
 }
 
-async function valhallaRoute(from, to, polys) {
+function tripToRoute(trip) {
+  if (!trip || !trip.legs || !trip.legs.length) return null;
+  const leg = trip.legs[0];
+  const coords = Geo.decode(leg.shape, 6), cum = Geo.cumulative(coords);
+  return { coords, cum, total: cum[cum.length - 1], miles: trip.summary.length, secs: trip.summary.time, maneuvers: leg.maneuvers || [] };
+}
+async function valhallaRoute(from, to, polys, alts = 0) {
   const body = {
     locations: [{ lat: from[0], lon: from[1] }, { lat: to[0], lon: to[1] }],
     costing: "auto",
     directions_options: { units: "miles", language: "en-US" }
   };
   if (polys.length) body.exclude_polygons = polys;
+  if (alts) body.alternates = alts;
   const j = await getJSON(CFG.valhalla, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  if (!j.trip || !j.trip.legs || !j.trip.legs.length) throw new Error("No route found.");
-  const leg = j.trip.legs[0];
-  const coords = Geo.decode(leg.shape, 6), cum = Geo.cumulative(coords);
-  return { coords, cum, total: cum[cum.length - 1], miles: j.trip.summary.length, secs: j.trip.summary.time, maneuvers: leg.maneuvers || [] };
+  const main = tripToRoute(j.trip);
+  if (!main) throw new Error("No route found.");
+  if (alts) main.alts = (j.alternates || []).map(a => tripToRoute(a && a.trip)).filter(Boolean);
+  return main;
 }
 
 async function overpassCameras(b) {
@@ -646,24 +700,22 @@ function render() {
 }
 
 /* ---------- routing ---------- */
-async function routeAroundCameras(from, to, cams, fast, seq) {
-  const cap = Math.max(1, Math.floor(CFG.excludeBudgetM / (8 * S.r)));
-  const excluded = new Map(); let best = fast, capped = false;
-  for (let pass = 0; pass < CFG.maxPasses; pass++) {
-    const hits = camsOn(best, cams).filter(c => !excluded.has(c.id));
-    if (!hits.length) break;
-    const added = [];
-    for (const c of hits) { if (excluded.size >= cap) { capped = true; break; } excluded.set(c.id, c); added.push(c); }
-    if (!added.length) break;
-    try { best = await valhallaRoute(from, to, [...excluded.values()].map(c => Geo.square(c.p, S.r))); }
-    catch (e) {
-      added.forEach(c => excluded.delete(c.id));
-      if (pass === 0) throw new Error("No way around these cameras. Try less clearance in settings.");
-      capped = true; break;
-    }
-    if (seq !== S.seq) return null;
-  }
-  return { route: best, capped };
+function routeAroundCameras(from, to, cams, fast, seq) {
+  return minimizeCameras({
+    from, to, cams, fast, r: S.r,
+    maxPasses: CFG.maxPasses, maxCalls: CFG.maxCalls, budgetM: CFG.excludeBudgetM,
+    route: polys => valhallaRoute(from, to, polys),
+    stale: () => seq !== S.seq,
+    onTry: n => { if (n > 1) status(`Trying other roads… (${n})`, "busy"); }
+  });
+}
+
+function whyLeft(res, after) {
+  const it = after === 1 ? "It's" : "They're";
+  if (res.ends && !res.blockers) return ` ${it} right at your start or destination.`;
+  if (res.blockers) return ` ${it} on the only road${after === 1 ? "" : "s"} through${res.ends ? " or at your start/destination" : ""}.`;
+  if (res.capped) return " Too many to route around in one search.";
+  return "";
 }
 
 async function avoidStep(seq) {
@@ -674,13 +726,14 @@ async function avoidStep(seq) {
     render(); return;
   }
   status(`Finding a way around ${before} camera${before > 1 ? "s" : ""}…`, "busy");
-  const res = await routeAroundCameras(S.from, S.to, list, S.fast, seq);
+  const res = await routeAroundCameras(S.routeFrom, S.to, list, S.fast, seq);
   if (!res) return;
   S.avoid = res.route; S.choice = "avoid";
   const after = camsOn(res.route, list).length, extra = Math.round((res.route.secs - S.fast.secs) / 60);
-  status(after === 0
-    ? `Avoids all ${before} camera${before > 1 ? "s" : ""}${extra > 0 ? `, +${extra} min` : ""}.`
-    : `Cuts cameras from ${before} to ${after}.${res.capped ? " The rest have no way around." : ""}`);
+  const plus = extra > 0 ? `, +${extra} min` : "";
+  status(after === 0 ? `Avoids all ${before} camera${before > 1 ? "s" : ""}${plus}.`
+    : after < before ? `Passes ${after} instead of ${before}${plus}.${whyLeft(res, after)}`
+    : `${before} is the fewest possible.${whyLeft(res, after)}`);
   render();
 }
 
@@ -703,7 +756,7 @@ async function plan() {
     const camP = ensureCams(pre).then(() => null, e => e);
     status("Getting routes…", "busy");
     S.routeFrom = from;
-    S.fast = await valhallaRoute(from, S.to, []);
+    S.fast = await valhallaRoute(from, S.to, [], 2);
     if (seq !== S.seq) return;
     status("Checking cameras…", "busy");
     const camErr = await camP;
