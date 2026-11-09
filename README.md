@@ -8,7 +8,7 @@ Blindspot is a web app you can install on your phone. Search for a destination a
 
 ## Features
 
-- **Fewest-camera routing.** Excludes the area around each camera on your route and asks the routing engine for a way around. Cameras that can't be avoided are let through one at a time instead of failing the whole route, and the server's own alternate routes are compared too.
+- **Fewest-camera routing that uses side streets.** Blocks only the road stretch each camera watches, so workarounds through nearby side streets and cross streets stay available. Cameras that truly can't be avoided are let through one at a time instead of failing the whole route, and a smaller-roads route and the server's alternates are compared too.
 - **Direction-aware cameras.** When OpenStreetMap records which way a camera points (`direction` / `camera:direction`), only the road in front of it counts. Plate readers only count for traffic moving toward or away from them, so cross streets aren't avoided for nothing. Cameras with no direction are treated as seeing every way.
 - **Extra-time budget.** Choose how much longer you'll drive to avoid cameras (5, 10, 15 or 30 minutes, or any). The status line explains why any cameras remain: at your start or destination, on the only road through, or too long a detour.
 - **Turn-by-turn navigation** with voice, "camera ahead" alerts, automatic rerouting around cameras if you miss a turn, and a fast-forward preview drive.
@@ -25,7 +25,7 @@ Blindspot is a web app you can install on your phone. Search for a destination a
 1. Search ([Photon](https://photon.komoot.io), with [Nominatim](https://nominatim.org) as fallback) turns an address into coordinates.
 2. [Valhalla](https://valhalla.github.io/valhalla/) on the FOSSGIS public server returns the fastest route plus alternates.
 3. [Overpass API](https://overpass-api.de) returns OpenStreetMap camera nodes (`man_made=surveillance`, `highway=speed_camera`) around the trip.
-4. For each camera the route passes, Blindspot sends an exclusion polygon back to Valhalla (a square, or a wedge for cameras with a known direction) and keeps the route with the fewest cameras that fits your time budget.
+4. For each camera the route passes, Blindspot asks Valhalla to skip only the stretch of road that camera watches (`exclude_locations`), so cross streets and side streets right next to it stay usable. If the new route still passes the camera, it blocks more of that road, and as a last resort the whole area around it (`exclude_polygons`). A route that prefers smaller roads (`use_highways: 0`) and the server's alternates are compared too. The result is the route with the fewest cameras that fits your time budget.
 5. The map is drawn with [MapLibre GL JS](https://maplibre.org) and [OpenFreeMap](https://openfreemap.org) tiles.
 
 It's all one `index.html` with no build step. `sw.js` adds offline caching and `manifest.webmanifest` makes it installable.

@@ -445,8 +445,9 @@ const CFG = {
   styleLight: "https://tiles.openfreemap.org/styles/liberty",
   styleDark: "https://tiles.openfreemap.org/styles/dark",
   excludeBudgetM: 9000,   // public Valhalla caps total exclusion-polygon perimeter (~10 km)
-  maxPasses: 6,
-  maxCalls: 14,           // routing requests per search, to stay polite to the free server
+  maxPasses: 8,
+  maxCalls: 18,           // routing requests per search, to stay polite to the free server
+  maxLocs: 48,            // roads excluded per request
   waypoints: 8,
   offRouteM: 45,
   cacheDays: 7
@@ -540,13 +541,9 @@ const Geo = {
     if (!c.dirs) return [Geo.square(c.p, r)];
     return [Geo.square(c.p, NEAR_M + 2), ...c.dirs.map(o => Geo.wedge(c.p, r + CONE_EXTRA + 5, o.c, Math.min(180, o.h + 5)))];
   },
-  // does route rt pass where camera c can see it?
-  sees(rt, c, r) {
-    const s = Geo.snap(rt.coords, rt.cum, c.p);
-    if (!c.dirs) return s.d <= r + 5;
-    const R = r + CONE_EXTRA;
-    if (s.d > R) return false;
-    if (s.d <= NEAR_M) return true;
+  // points (every ~4 m) where route rt is inside camera c's view: [{p:[lat,lng], d, along}]
+  viewSamples(rt, c, r, firstOnly) {
+    const R = c.dirs ? r + CONE_EXTRA : r + 5, out = [];
     const L = rt.coords, kx = Math.cos(c.p[0] * Math.PI / 180) * 111320, ky = 110540, plate = c.type === "alpr";
     for (let i = 0; i < L.length - 1; i++) {
       const ax = (L[i][1] - c.p[1]) * kx, ay = (L[i][0] - c.p[0]) * ky;
@@ -558,15 +555,40 @@ const Geo = {
       for (let k = 0; k <= n; k++) {
         const px = ax + dx * k / n, py = ay + dy * k / n, d = Math.hypot(px, py);
         if (d > R) continue;
-        if (d <= NEAR_M) return true;
-        const brg = (Math.atan2(px, py) * 180 / Math.PI + 360) % 360;
-        for (const o of c.dirs) {
-          if (Geo.angDiff(brg, o.c) > o.h) continue;
-          if (!plate || Geo.angDiff(heading, o.c) <= ALPR_AXIS || Geo.angDiff(heading, o.c + 180) <= ALPR_AXIS) return true;
+        let seen = !c.dirs || d <= NEAR_M;
+        if (!seen) {
+          const brg = (Math.atan2(px, py) * 180 / Math.PI + 360) % 360;
+          for (const o of c.dirs) {
+            if (Geo.angDiff(brg, o.c) > o.h) continue;
+            if (!plate || Geo.angDiff(heading, o.c) <= ALPR_AXIS || Geo.angDiff(heading, o.c + 180) <= ALPR_AXIS) { seen = true; break; }
+          }
         }
+        if (!seen) continue;
+        if (firstOnly) return [true];
+        out.push({ p: [c.p[0] + py / ky, c.p[1] + px / kx], d, along: rt.cum[i] + (rt.cum[i + 1] - rt.cum[i]) * k / n });
       }
     }
-    return false;
+    return out;
+  },
+  // does route rt pass where camera c can see it?
+  sees(rt, c, r) {
+    const s = Geo.snap(rt.coords, rt.cum, c.p);
+    if (!c.dirs) return s.d <= r + 5;
+    if (s.d > r + CONE_EXTRA) return false;
+    if (s.d <= NEAR_M) return true;
+    return Geo.viewSamples(rt, c, r, true).length > 0;
+  },
+  // a few points on the stretch of route the camera watches; excluding the roads under them blocks just that stretch
+  watchPoints(rt, c, r, max = 4) {
+    const s = Geo.viewSamples(rt, c, r, false);
+    if (!s.length) return [Geo.snap(rt.coords, rt.cum, c.p).q];
+    const nearest = s.reduce((m, x) => (x.d < m.d ? x : m));
+    const picked = [nearest];
+    for (const x of s) {
+      if (picked.length >= max) break;
+      if (picked.every(y => Math.abs(y.along - x.along) >= 35)) picked.push(x);
+    }
+    return picked.map(x => x.p);
   },
   // OSM direction tag -> [{c: bearing, h: half-angle}] or null (unknown = sees every way)
   parseDirs(v) {
@@ -642,50 +664,84 @@ const TURN = { 1: 0, 2: 0, 3: 0, 4: null, 5: null, 6: null, 7: 0, 8: 0, 9: 45, 1
   17: 0, 18: 40, 19: -40, 20: 45, 21: -45, 22: 0, 23: 30, 24: -30, 25: 0, 26: 70, 27: 45 };
 
 /* Find the route that passes the fewest cameras within the extra-time budget.
-   Cameras are excluded in batches; when a batch fails, each camera is tried alone, keeping the detours that work.
-   Every route seen (plus the server's alternates) is a candidate: fewest cameras wins, then fastest. */
-async function minimizeCameras({ from, to, cams, fast, r, route, maxExtraSecs = Infinity, maxPasses = 6, maxCalls = 14, budgetM = 9000, stale = () => false, onTry = () => {} }) {
+   Each camera on the route is blocked by excluding only the road stretch it watches (exclude_locations),
+   so cross streets and side streets right next to it stay usable. If the new route still passes that camera
+   (another road it can see), more of its stretch is blocked; a whole area (polygon) is the last resort.
+   Every route seen, plus the server's alternates and a side-streets seed, is a candidate:
+   fewest cameras wins, then fastest. */
+async function minimizeCameras({ from, to, cams, fast, seeds = [], r, route, maxExtraSecs = Infinity, maxPasses = 8, maxCalls = 18, maxLocs = 48, budgetM = 9000, stale = () => false, onTry = () => {} }) {
   const onRoute = (rt, list) => list.filter(c => Geo.sees(rt, c, r));
-  const perim = c => Geo.zone(c, r).reduce((s, ring) => s + Geo.ringPerimeter(ring), 0);
+  const nOn = rt => onRoute(rt, cams).length;
+  const okTime = rt => rt.secs <= fast.secs + maxExtraSecs;
   const clear = r + 40;
   const atEnds = c => Geo.meters(c.p, from) < clear || Geo.meters(c.p, to) < clear;
-  const okTime = rt => rt.secs <= fast.secs + maxExtraSecs;
-  const excluded = new Map(), why = new Map();
-  const cands = [fast, ...(fast.alts || []).filter(okTime)];
-  let best = fast, calls = 0, capped = false, used = 0;
+  const ex = new Map(), why = new Map();                    // ex: id -> {c, locs, zone, tries}
+  const cands = [fast, ...[...(fast.alts || []), ...seeds].filter(rt => rt && okTime(rt))];
+  let best = cands.reduce((a, b) => (nOn(b) < nOn(a) || (nOn(b) === nOn(a) && b.secs < a.secs) ? b : a));
+  let calls = 0, capped = false;
+
+  const request = extra => {
+    const all = new Map(ex); for (const e of extra) all.set(e.c.id, e);
+    const locs = [], polys = [];
+    for (const e of all.values()) { if (e.zone) polys.push(...Geo.zone(e.c, r)); else locs.push(...e.locs); }
+    return { locs, polys };
+  };
+  const fits = q => q.locs.length <= maxLocs && q.polys.reduce((s, g) => s + Geo.ringPerimeter(g), 0) <= budgetM;
   const tryRoute = async extra => {
+    const q = request(extra);
+    if (!fits(q)) return { fail: "full" };
     if (calls >= maxCalls) return null;
     calls++; onTry(calls);
     let rt;
-    try { rt = await route([...excluded.values(), ...extra].flatMap(c => Geo.zone(c, r))); } catch { return { fail: "road" }; }
+    try { rt = await route(q); } catch { return { fail: "road" }; }
     return okTime(rt) ? { rt } : { fail: "long" };
   };
+  const accept = (list, rt) => { list.forEach(e => ex.set(e.c.id, e)); best = rt; cands.push(rt); };
+  // how to block camera c next: its watched stretch first, then a wider stretch, then the whole area
+  const nextBlock = c => {
+    const prev = ex.get(c.id);
+    if (!prev) return { c, locs: Geo.watchPoints(best, c, r), zone: false, tries: 1 };
+    if (prev.zone) return null;
+    if (prev.tries === 1) return { c, locs: prev.locs.concat(Geo.watchPoints(best, c, r, 6)), zone: false, tries: 2 };
+    return { c, locs: [], zone: true, tries: 3 };
+  };
+
   for (let pass = 0; pass < maxPasses; pass++) {
-    let hits = onRoute(best, cams).filter(c => !excluded.has(c.id) && !why.has(c.id));
+    let hits = onRoute(best, cams).filter(c => !why.has(c.id));
     for (const c of hits) if (atEnds(c)) why.set(c.id, "end");
     hits = hits.filter(c => !why.has(c.id));
     if (!hits.length) break;
-    const add = []; let addP = 0;
-    for (const c of hits) { const p = perim(c); if (used + addP + p > budgetM) { capped = true; break; } add.push(c); addP += p; }
-    if (!add.length) { capped = true; break; }
+    const add = [];
+    for (const c of hits) { const b = nextBlock(c); if (b) add.push(b); else why.set(c.id, "road"); }
+    if (!add.length) continue;
     let res = await tryRoute(add);
     if (stale()) return null;
     if (res === null) { capped = true; break; }
-    if (res.rt) { add.forEach(c => excluded.set(c.id, c)); used += addP; best = res.rt; cands.push(res.rt); continue; }
-    for (const c of add) {
-      if (!onRoute(best, [c]).length) continue;            // an earlier detour already skipped it
-      res = await tryRoute([c]);
+    if (res.rt) { accept(add, res.rt); continue; }
+    // the batch failed: try each camera on its own, keeping every detour that works
+    for (const b of add) {
+      if (!onRoute(best, [b.c]).length) continue;
+      res = await tryRoute([b]);
       if (stale()) return null;
       if (res === null) { capped = true; break; }
-      if (res.rt) { excluded.set(c.id, c); used += perim(c); best = res.rt; cands.push(res.rt); }
-      else why.set(c.id, res.fail);
+      if (res.rt) { accept([b], res.rt); continue; }
+      if (!b.zone && res.fail === "road") {                 // blocking the roads failed outright; try the area instead
+        const z = { c: b.c, locs: [], zone: true, tries: 3 };
+        const r2 = await tryRoute([z]);
+        if (stale()) return null;
+        if (r2 === null) { capped = true; break; }
+        if (r2.rt) { accept([z], r2.rt); continue; }
+        res = r2;
+      }
+      why.set(b.c.id, res.fail);
     }
     if (capped) break;
   }
-  const scored = cands.map(rt => ({ rt, n: onRoute(rt, cams).length }));
+  const scored = cands.map(rt => ({ rt, n: nOn(rt) }));
   scored.sort((a, b) => a.n - b.n || a.rt.secs - b.rt.secs);
   const left = onRoute(scored[0].rt, cams), count = k => left.filter(c => why.get(c.id) === k).length;
-  return { route: scored[0].rt, ends: count("end"), blockers: count("road"), long: count("long"), capped, calls };
+  const unexplained = left.length - count("end") - count("road") - count("long");
+  return { route: scored[0].rt, ends: count("end"), blockers: count("road"), long: count("long"), capped: capped || unexplained > 0, calls };
 }
 
 if (typeof module !== "undefined") module.exports = { Geo, Fmt, TURN, minimizeCameras };
@@ -711,14 +767,17 @@ function tripToRoute(trip) {
   const coords = Geo.decode(leg.shape, 6), cum = Geo.cumulative(coords);
   return { coords, cum, total: cum[cum.length - 1], miles: trip.summary.length, secs: trip.summary.time, maneuvers: leg.maneuvers || [] };
 }
-async function valhallaRoute(from, to, polys, alts = 0) {
+// ex: {locs: [[lat,lng]...] roads to skip, polys: [[lon,lat] rings] areas to skip}; auto: Valhalla auto costing options
+async function valhallaRoute(from, to, ex = {}, alts = 0, auto = null) {
   const body = {
     locations: [{ lat: from[0], lon: from[1] }, { lat: to[0], lon: to[1] }],
     costing: "auto",
     directions_options: { units: "miles", language: "en-US" }
   };
-  if (polys.length) body.exclude_polygons = polys;
+  if (ex.locs && ex.locs.length) body.exclude_locations = ex.locs.map(p => ({ lat: +p[0].toFixed(6), lon: +p[1].toFixed(6) }));
+  if (ex.polys && ex.polys.length) body.exclude_polygons = ex.polys;
   if (alts) body.alternates = alts;
+  if (auto) body.costing_options = { auto };
   const j = await getJSON(CFG.valhalla, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const main = tripToRoute(j.trip);
   if (!main) throw new Error("No route found.");
@@ -1031,9 +1090,9 @@ function render() {
 /* ---------- routing ---------- */
 function routeAroundCameras(from, to, cams, fast, seq) {
   return minimizeCameras({
-    from, to, cams, fast, r: S.r, maxExtraSecs: maxExtraSecs(),
-    maxPasses: CFG.maxPasses, maxCalls: CFG.maxCalls, budgetM: CFG.excludeBudgetM,
-    route: polys => valhallaRoute(from, to, polys),
+    from, to, cams, fast, seeds: S.seeds || [], r: S.r, maxExtraSecs: maxExtraSecs(),
+    maxPasses: CFG.maxPasses, maxCalls: CFG.maxCalls, maxLocs: CFG.maxLocs, budgetM: CFG.excludeBudgetM,
+    route: q => valhallaRoute(from, to, q),
     stale: () => seq !== S.seq,
     onTry: n => { if (n > 1) status(`Trying other roads… (${n})`, "busy"); }
   });
@@ -1082,7 +1141,10 @@ async function plan() {
     const camP = ensureCams(pre).then(() => null, e => e);
     status("Getting routes…", "busy");
     S.routeFrom = from;
-    S.fast = await valhallaRoute(from, S.to, [], 2);
+    // fastest route + alternates, and in parallel a route that prefers smaller roads (a ready-made side-street option)
+    const sideP = valhallaRoute(from, S.to, {}, 0, { use_highways: 0 }).catch(() => null);
+    S.fast = await valhallaRoute(from, S.to, {}, 2);
+    S.seeds = [await sideP].filter(Boolean);
     if (seq !== S.seq) return;
     status("Checking cameras…", "busy");
     const camErr = await camP;
@@ -1441,8 +1503,8 @@ async function navReroute(p) {
   $("turnText").textContent = "Rerouting around cameras…"; speak("Rerouting.");
   const seq = ++S.seq;
   try {
-    S.routeFrom = p;
-    S.fast = await valhallaRoute(p, S.to, [], 2);
+    S.routeFrom = p; S.seeds = [];
+    S.fast = await valhallaRoute(p, S.to, {}, 2);
     await ensureCams(Geo.bbox(S.fast.coords, 0.01));
     let r = S.fast;
     if (S.choice !== "fast") {

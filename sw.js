@@ -3,7 +3,7 @@
 // - App icons and libraries: cached once.
 // - Map tiles: served from cache when present and refreshed in the background (capped).
 // - Routing, search, camera and note requests are never cached.
-const VERSION = "blindspot-v3";
+const VERSION = "blindspot-v3.1";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png"];
 const LIB_HOSTS = ["unpkg.com", "fonts.googleapis.com", "fonts.gstatic.com"];
 const TILE_HOST = "tiles.openfreemap.org";
